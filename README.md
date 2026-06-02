@@ -99,11 +99,31 @@ Standard library modules used: `csv`, `json`, `math`, `os`, `re`, `sys`, `time`,
 
 ### Step 5: Merge Data Sources
 
-**Output:** `data/outlets_raw.csv` (~375 physical outlets)
+Combines three raw sources into a single outlet list:
+
+- `outlets_list.csv` — win counts per outlet (375 physical outlets)
+- `outlets_with_addresses.csv` — postal codes (exact name match, 375/375)
+- `gra_outlets.csv` — outlet type, enriched via postal code match only (no fuzzy matching)
+
+Also appends GRA outlets that never appeared in the Singapore Pools winning list (zero wins, 9 outlets).
+
+**Output:** `data/outlets_raw.csv` (~383 physical outlets)
+
+| Column | Description |
+|--------|-------------|
+| `outlet_name` | Outlet display name |
+| `postal_code` | 6-digit Singapore postal code |
+| `outlet_type` | GRA-derived type (empty if no GRA match) |
+| `group1_wins` | TOTO Group 1 (jackpot) wins |
+| `group2_wins` | TOTO Group 2 wins |
+| `combined_wins` | Total wins |
+| `source` | `matched` (GRA postal match) / `scraped` / `gra_only` |
 
 ---
 
 ### Step 6: Geocode via OneMap API
+
+Looks up coordinates for each outlet using Singapore's OneMap API, by postal code. 4 outlets not found in OneMap are resolved via manually verified coordinates.
 
 **Source:** OneMap Singapore Geocoding API
 
@@ -116,10 +136,18 @@ Added columns:
 | `latitude` | WGS84 latitude |
 | `longitude` | WGS84 longitude |
 | `onemap_address` | Standardized address from OneMap |
-| `planning_area` | URA planning area name (e.g., "BEDOK") |
 | `x_svy21` | SVY21 X coordinate |
 | `y_svy21` | SVY21 Y coordinate |
 | `geocode_status` | "OK" or "FAILED" |
+
+**Manual geocodes (OneMap not found):**
+
+| Outlet | Reason |
+|--------|--------|
+| Singapore Pools Choa Chu Kang Branch | Postal code not indexed in OneMap |
+| Singapore Pools Woodlands Centre | Postal code not indexed in OneMap |
+| Singapore Pools Rochor Centre Branch | Postal code not indexed in OneMap |
+| Cheers Woodlands Centre | Postal code not indexed in OneMap |
 
 ---
 
@@ -127,55 +155,46 @@ Added columns:
 
 **Stesp:**
 
-1. **Planning Area Assignment:** For outlets missing a planning area, assigns the nearest planning area by computing Haversine distance to each planning area centroid (max 5km threshold).
+1. **Planning Area Assignment:** Assigns nearest URA planning area to each outlet via Haversine distance to planning area centroids (max 5km threshold).
 
 2. **Region Assignment:** Maps each outlet's planning area to its URA region (e.g., "EAST REGION", "CENTRAL REGION") using GeoJSON properties.
 
-3. **Area Type Classification:** Classifies each outlet as `residential` (planning area has HDB units) or `commercial` (planning area exists but has no HDB units).
+3. **Area Type Classification:** Classifies outlet as `commercial` if its planning area is in a known commercial zone (Downtown Core, Orchard, Museum etc.), otherwise `residential`.
 
-4. **HDB Proxy Computation:** For each outlet, counts total HDB dwelling units within 4 radii (500m, 750m, 1km, 1.5km) using Haversine distance from the outlet to each planning area centroid. The proxy represents nearby residential density as an approximation for potential foot traffic and ticket sales volume.
+4. **HDB Block Count Proxy:** For each outlet, counts the number of HDB blocks within 4 radii (500m, 750m, 1km, 1.5km) using Haversine distance to each of the ~13,400 block centroids. This is used as a proxy for residential foot traffic and ticket sales exposure (λᵢ in the Poisson model). Note: proxy captures ~77% of Singapore's resident population (HDB residents); private residential areas are not reflected.
 
-5. **Win Rate Computation:** `win_rate_1000m = combined_wins / proxy_1000m`: wins per HDB unit within 1km, measuring outlet "luckiness" normalised by local population density.
-
-6. **Validation Summary:** counts of residential vs commercial outlets, proxy coverage, region distribution and top 10 outlets by combined wins.
+5. **Win Rate:** `win_rate_1000m = combined_wins / proxy_1000m` — wins per nearby HDB block within 1km.
 
 **Output:** `data/analysis_ready/outlets_final.csv`
 
 | Column | Type | Description |
 |--------|------|-------------|
 | `outlet_name` | str | Outlet display name |
-| `address` | str | Raw scraped address |
 | `postal_code` | str | 6-digit Singapore postal code |
 | `outlet_type` | str | GRA-derived type (e.g., "Branch", "Authorised Retailer") |
 | `group1_wins` | int | TOTO Group 1 (jackpot) wins |
 | `group2_wins` | int | TOTO Group 2 wins |
 | `combined_wins` | int | Total wins |
-| `source` | str | Data source: matched/scraped/aggregate_only/gra_only |
+| `source` | str | Data source: `matched` / `scraped` / `gra_only` |
 | `latitude` | float | WGS84 latitude |
 | `longitude` | float | WGS84 longitude |
-| `onemap_address` | str | Standardized address from OneMap |
+| `onemap_address` | str | Standardised address from OneMap |
 | `planning_area` | str | URA planning area (uppercase) |
 | `x_svy21` | float | SVY21 X coordinate |
 | `y_svy21` | float | SVY21 Y coordinate |
-| `geocode_status` | str | "OK" |
-| `proxy_500m` | int | HDB units within 500m radius |
-| `proxy_750m` | int | HDB units within 750m radius |
-| `proxy_1000m` | int | HDB units within 1km radius |
-| `proxy_1500m` | int | HDB units within 1.5km radius |
-| `area_type` | str | "residential" or "commercial" |
+| `geocode_status` | str | `OK` |
+| `proxy_500m` | int | HDB blocks within 500m radius |
+| `proxy_750m` | int | HDB blocks within 750m radius |
+| `proxy_1000m` | int | HDB blocks within 1km radius |
+| `proxy_1500m` | int | HDB blocks within 1.5km radius |
+| `area_type` | str | `residential` or `commercial` |
 | `region` | str | URA region (e.g., "EAST REGION") |
-| `pa_hdb_units` | int | Total HDB units in the outlet's planning area |
-| `win_rate_1000m` | float | combined_wins / proxy_1000m |
+| `win_rate_1000m` | float | `combined_wins / proxy_1000m` |
 
 ---
 
-## HDB Town-to-Planning Area Mapping
+## Known Limitations
 
-The HDB dataset uses 27 town names while URA uses 55 planning areas. The mapping is mostly 1:1, with two special cases:
-
-| HDB Town | Planning Area(s) |
-|----------|-----------------|
-| Central Area | DOWNTOWN CORE, MARINA SOUTH, MUSEUM, OUTRAM, RIVER VALLEY, ROCHOR |
-| Kallang/Whampoa | KALLANG |
-
-For "Central Area", HDB units are split equally across the 6 corresponding planning areas. All other towns map to a single planning area of the same name (uppercase).
+- **HDB proxy only:** ~77% of Singapore's population lives in HDB. Outlets in private residential areas (River Valley, Orchard, Bukit Timah) or commercial/transit zones (HarbourFront, Changi Business Park) will have underestimated exposure, potentially inflating their apparent win rates.
+- **No outlet opening dates:** Exposure period is not normalised by how long each outlet has been operating. Older outlets mechanically accumulate more wins. The `outlet_win_history.csv` earliest draw date can be used as a lower-bound proxy for opening date in downstream analysis.
+- **Area type is binary:** Classification is residential vs commercial based on planning area only. Mixed-use outlets (e.g. NTUC in an HDB town centre adjacent to a mall) are not distinguished.
