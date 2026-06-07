@@ -40,6 +40,7 @@ SUPPLEMENTARY_DATASETS = [
     {"name": "URA Planning Area Boundary", "dataset_id": "d_4765db0e87b9c86336792efe8a1f7a66", "filename": "planning_area_boundary.geojson"},
     {"name": "HDB Existing Building", "dataset_id": "d_16b157c52ed637edd6ba1232e026258d", "filename": "hdb_existing_building.geojson"},
     {"name": "URA Master Plan 2019 Land Use", "dataset_id": "d_90d86daa5bfaa371668b84fa5f01424f", "filename": "master_plan_land_use.geojson"},
+    {"name": "Census 2020 Population by Planning Area (Dwelling Type)", "dataset_id": "d_7f243956483d5901f237e6f87b096636", "filename": "census2020_pop_by_dwelling.csv"},
 ]
 
 MANUAL_GEOCODES = {
@@ -91,6 +92,66 @@ def polygon_centroid(geom):
         return None, None
     return sum(p[1] for p in pts) / len(pts), sum(p[0] for p in pts) / len(pts)
 
+
+def load_pa_index():
+    """Load PA polygons, bounding boxes, centroids, and regions. Returns (pa_features, pa_bounds, pa_centroids, pa_regions)."""
+    pa_features, pa_bounds, pa_centroids, pa_regions = [], {}, {}, {}
+    pa_path = SUPP_DIR / "planning_area_boundary.geojson"
+    if not pa_path.exists():
+        return pa_features, pa_bounds, pa_centroids, pa_regions
+    with open(pa_path, encoding="utf-8") as f:
+        for feature in json.load(f)["features"]:
+            props = feature["properties"]
+            name = props["PLN_AREA_N"]
+            pa_regions[name] = props["REGION_N"]
+            pa_features.append((name, feature))
+            geom = feature.get("geometry")
+            pts = []
+            if geom["type"] == "Polygon":
+                pts = geom["coordinates"][0]
+            elif geom["type"] == "MultiPolygon":
+                for poly in geom["coordinates"]:
+                    pts.extend(poly[0])
+            if pts:
+                pa_bounds[name] = (min(p[1] for p in pts), max(p[1] for p in pts),
+                                   min(p[0] for p in pts), max(p[0] for p in pts))
+            lat, lon = polygon_centroid(geom)
+            if lat is not None:
+                pa_centroids[name] = (lat, lon)
+    return pa_features, pa_bounds, pa_centroids, pa_regions
+
+
+def point_in_polygon(lon, lat, ring):
+    inside, n, j = False, len(ring), len(ring) - 1
+    for i in range(n):
+        xi, yi = ring[i][0], ring[i][1]
+        xj, yj = ring[j][0], ring[j][1]
+        if ((yi > lat) != (yj > lat)) and (lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi):
+            inside = not inside
+        j = i
+    return inside
+
+
+def find_pa(lat, lon, pa_features, pa_bounds, pa_centroids):
+    """Point-in-polygon PA lookup with nearest-centroid fallback."""
+    for pa_name, (min_lat, max_lat, min_lon, max_lon) in pa_bounds.items():
+        if min_lat <= lat <= max_lat and min_lon <= lon <= max_lon:
+            feature = next(f for n, f in pa_features if n == pa_name)
+            geom = feature["geometry"]
+            if geom["type"] == "Polygon":
+                if point_in_polygon(lon, lat, geom["coordinates"][0]):
+                    return pa_name
+            elif geom["type"] == "MultiPolygon":
+                if any(point_in_polygon(lon, lat, poly[0]) for poly in geom["coordinates"]):
+                    return pa_name
+    # fallback: nearest centroid for coastal/edge outlets
+    best_pa, best_d = "", float("inf")
+    for pn, (clat, clon) in pa_centroids.items():
+        d = haversine_m(lat, lon, clat, clon)
+        if d < best_d:
+            best_d, best_pa = d, pn
+    return best_pa if best_d < 5000 else ""
+    
 
 def download_dataset(dataset_id, output_path):
     if output_path.exists():
@@ -471,19 +532,7 @@ def step7_extract_centroids():
 
 
 def step8_build_geodata(geocoded_outlets, lu_centroids, hdb_blocks):
-    pa_centroids, pa_regions = {}, {}
-    pa_path = SUPP_DIR / "planning_area_boundary.geojson"
-    if pa_path.exists():
-        with open(pa_path, encoding="utf-8") as f:
-            for feature in json.load(f)["features"]:
-                props = feature["properties"]
-                name = props["PLN_AREA_N"]
-                pa_regions[name] = props["REGION_N"]
-                geom = feature.get("geometry")
-                if geom:
-                    lat, lon = polygon_centroid(geom)
-                    if lat is not None:
-                        pa_centroids[name] = (lat, lon)
+    pa_features, pa_bounds, pa_centroids, pa_regions = load_pa_index()
 
     outlets = []
     for o in geocoded_outlets:
@@ -495,21 +544,24 @@ def step8_build_geodata(geocoded_outlets, lu_centroids, hdb_blocks):
             continue
         pa = (o.get("planning_area") or "").strip().upper()
         if not pa:
-            best_pa, best_d = "", float("inf")
-            for pn, (clat, clon) in pa_centroids.items():
-                d = haversine_m(lat, lon, clat, clon)
-                if d < best_d:
-                    best_d, best_pa = d, pn
-            if best_pa and best_d < 5000:
-                pa = best_pa
-        outlets.append({"outlet_name": o["outlet_name"], "postal_code": o.get("postal_code", ""), "outlet_type": o.get("outlet_type", ""), "group1_wins": int(o.get("group1_wins", 0)), "group2_wins": int(o.get("group2_wins", 0)), "combined_wins": int(o.get("combined_wins", 0)), "source": o.get("source", ""), "latitude": lat, "longitude": lon, "onemap_address": o.get("onemap_address", ""), "planning_area": pa, "region": pa_regions.get(pa, ""), "geocode_status": "OK"})
+            pa = find_pa(lat, lon, pa_features, pa_bounds, pa_centroids)
+        outlets.append({
+            "outlet_name": o["outlet_name"], "postal_code": o.get("postal_code", ""),
+            "outlet_type": o.get("outlet_type", ""), "group1_wins": int(o.get("group1_wins", 0)),
+            "group2_wins": int(o.get("group2_wins", 0)), "combined_wins": int(o.get("combined_wins", 0)),
+            "source": o.get("source", ""), "latitude": lat, "longitude": lon,
+            "onemap_address": o.get("onemap_address", ""), "planning_area": pa,
+            "region": pa_regions.get(pa, ""), "geocode_status": "OK",
+        })
 
     deg_box = max(RADII) / 111320.0 * 1.15
     for idx, outlet in enumerate(outlets):
         olat, olon = outlet["latitude"], outlet["longitude"]
-        nearby_lu = [(cat, clat, clon, area) for cat, clat, clon, area in lu_centroids if abs(clat - olat) <= deg_box and abs(clon - olon) <= deg_box]
+        nearby_lu = [(cat, clat, clon, area) for cat, clat, clon, area in lu_centroids
+                     if abs(clat - olat) <= deg_box and abs(clon - olon) <= deg_box]
         lu_dists = [(cat, area, haversine_m(olat, olon, clat, clon)) for cat, clat, clon, area in nearby_lu]
-        nearby_hdb = [haversine_m(olat, olon, blat, blon) for blat, blon in hdb_blocks if abs(blat - olat) <= deg_box and abs(blon - olon) <= deg_box]
+        nearby_hdb = [haversine_m(olat, olon, blat, blon) for blat, blon in hdb_blocks
+                      if abs(blat - olat) <= deg_box and abs(blon - olon) <= deg_box]
         for radius in RADII:
             abc = defaultdict(float)
             for cat, area, dist in lu_dists:
@@ -527,7 +579,9 @@ def step8_build_geodata(geocoded_outlets, lu_centroids, hdb_blocks):
             outlet[f"rc_ratio_{radius}m"] = round(res_t / denom, 4) if denom > 0 else 0.5
         rc, hdb = outlet["rc_ratio_1000m"], outlet["hdb_blocks_1000m"]
         outlet["neighborhood_type"] = "residential" if rc >= 0.65 and hdb >= 5 else ("commercial" if rc <= 0.35 else "mixed")
-        a1k = {"res": outlet["res_area_1000m"], "com": outlet["com_area_1000m"], "mixed": outlet["mixed_area_1000m"], "inst": outlet["inst_area_1000m"], "open": outlet["open_area_1000m"]}
+        a1k = {"res": outlet["res_area_1000m"], "com": outlet["com_area_1000m"],
+               "mixed": outlet["mixed_area_1000m"], "inst": outlet["inst_area_1000m"],
+               "open": outlet["open_area_1000m"]}
         outlet["dominant_landuse_1000m"] = max(a1k, key=a1k.get) if any(a1k.values()) else "unknown"
         outlet["landuse_diversity_1000m"] = sum(1 for v in a1k.values() if v > 0)
         hdb1k, wins = outlet["hdb_blocks_1000m"], outlet["combined_wins"]
@@ -636,8 +690,114 @@ def _save_hours(done):
         w.writeheader()
         w.writerows(rows)
 
+def step11a_load_population(): #extract population per PA
+    path = SUPP_DIR / "census2020_pop_by_dwelling.csv"
+    pop_by_pa = {}
+    with open(path, newline="", encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            pa_raw = row.get("Number", "").strip()
+            if not pa_raw.endswith("- Total"):
+                continue
+            pa_name = pa_raw.replace("- Total", "").strip().upper()
+            total = row.get("Total", "").strip().replace(",", "")
+            if total.isdigit():
+                pop_by_pa[pa_name] = int(total)
+    print(f"  {len(pop_by_pa)} planning areas with population data")
+    print(list(pop_by_pa.items())[:5])
+    return pop_by_pa
 
-def step11_save(outlets, hours, earliest_years):
+
+def step11b_res_area_by_pa():
+    cache_path = SUPP_DIR / "land_use_centroids_with_pa.csv"
+    if cache_path.exists():
+        print(f"  [SKIP] {cache_path.name}")
+        res_area_pa = defaultdict(float)
+        with open(cache_path, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                cat = row["lu_category"]
+                if cat not in ("residential", "mixed"):
+                    continue
+                pa = row["planning_area"]
+                area = float(row["area_sqm"])
+                weight = 1.0 if cat == "residential" else 0.5
+                res_area_pa[pa] += area * weight
+        print(f"  {len(res_area_pa)} planning areas with residential area")
+        return res_area_pa
+
+    lu_cache = SUPP_DIR / "land_use_centroids.csv"
+    if not lu_cache.exists():
+        print("  [WARN] land_use_centroids.csv not found — run step7 first")
+        return defaultdict(float)
+
+    pa_features, pa_bounds, pa_centroids, _ = load_pa_index()
+
+    with open(lu_cache, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    print(f"  Assigning {len(rows)} centroids to planning areas...")
+
+    assigned = []
+    res_area_pa = defaultdict(float)
+    for i, row in enumerate(rows):
+        lat, lon = float(row["latitude"]), float(row["longitude"])
+        pa = find_pa(lat, lon, pa_features, pa_bounds, pa_centroids)
+        assigned.append({**row, "planning_area": pa})
+        cat = row["lu_category"]
+        if cat in ("residential", "mixed") and pa:
+            weight = 1.0 if cat == "residential" else 0.5
+            res_area_pa[pa] += float(row["area_sqm"]) * weight
+        if (i + 1) % 10000 == 0:
+            print(f"  [{i+1}/{len(rows)}] assigned...")
+
+    with open(cache_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["lu_category", "latitude", "longitude", "area_sqm", "planning_area"])
+        writer.writeheader()
+        writer.writerows(assigned)
+    print(f"  {len(res_area_pa)} planning areas with residential area")
+    return res_area_pa
+
+def step12_save(outlets, hours, earliest_years):
+    # --- Deduplicate by postal code: sum wins, keep current outlet ---
+    from collections import defaultdict
+    postal_groups = defaultdict(list)
+    for o in outlets:
+        pc = o.get("postal_code", "").strip()
+        if pc:
+            postal_groups[pc].append(o)
+        
+    deduped = []
+    for pc, group in postal_groups.items():
+        if len(group) == 1:
+            deduped.append(group[0])
+            continue
+        # determine current outlet: prefer one with hours, then later earliest_win_year
+        def outlet_score(o):
+            name = o["outlet_name"]
+            has_hours = 1 if hours.get(name, {}).get("open_hours_daily", "") != "" else 0
+            win_year = earliest_years.get(name, 0) or 0
+            return (has_hours, win_year)
+        group.sort(key=outlet_score, reverse=True)
+        current = group[0]
+        total_g1 = sum(int(o["group1_wins"]) for o in group)
+        total_g2 = sum(int(o["group2_wins"]) for o in group)
+        current["group1_wins"] = total_g1
+        current["group2_wins"] = total_g2
+        current["combined_wins"] = total_g1 + total_g2
+        names = [o["outlet_name"] for o in group]
+        print(f"  [DEDUP] {pc}: merged {names} → '{current['outlet_name']}' (wins: {current['combined_wins']})")
+        deduped.append(current)
+    
+    # handle outlets with no postal code (pass through unchanged)
+    for o in outlets:
+        if not o.get("postal_code", "").strip():
+            deduped.append(o)
+
+    outlets = deduped
+    print(f"  After dedup: {len(outlets)} outlets")
+    
+    print("\n[11/12] Load population & compute density")
+    pop_by_pa = step11a_load_population()
+    res_area_pa = step11b_res_area_by_pa()
+
     for outlet in outlets:
         name = outlet["outlet_name"]
         year = earliest_years.get(name)
@@ -648,6 +808,12 @@ def step11_save(outlets, hours, earliest_years):
         outlet["close_time"] = h.get("close_time", "")
         outlet["open_hours_daily"] = h.get("open_hours_daily", "")
         outlet["has_varying_hours"] = h.get("has_varying_hours", "")
+        pa = outlet.get("planning_area", "").strip().upper()
+        pop = pop_by_pa.get(pa, 0)
+        res_area = res_area_pa.get(pa, 0)
+        density = pop / res_area if res_area > 0 else 0.0  # people per m²
+        for radius in RADII:
+            outlet[f"pop_{radius}m"] = round(outlet.get(f"res_area_{radius}m", 0) * density)
 
     fieldnames = [
         "outlet_name", "postal_code", "outlet_type",
@@ -656,7 +822,7 @@ def step11_save(outlets, hours, earliest_years):
         "res_area_500m", "com_area_500m", "mixed_area_500m", "inst_area_500m", "open_area_500m", "hdb_blocks_500m", "rc_ratio_500m",
         "res_area_1000m", "com_area_1000m", "mixed_area_1000m", "inst_area_1000m", "open_area_1000m", "hdb_blocks_1000m", "rc_ratio_1000m",
         "res_area_1500m", "com_area_1500m", "mixed_area_1500m", "inst_area_1500m", "open_area_1500m", "hdb_blocks_1500m", "rc_ratio_1500m",
-        "neighborhood_type", "dominant_landuse_1000m", "landuse_diversity_1000m", "win_rate_hdb_1000m",
+        "pop_500m", "pop_1000m", "pop_1500m","neighborhood_type", "dominant_landuse_1000m", "landuse_diversity_1000m", "win_rate_hdb_1000m",
         "earliest_win_year", "years_winning", "open_time", "close_time", "open_hours_daily", "has_varying_hours",
     ]
     with open(OUT_DIR / "outlets_geodata.csv", "w", newline="", encoding="utf-8") as f:
@@ -669,42 +835,42 @@ def step11_save(outlets, hours, earliest_years):
 def main():
     start = time.time()
 
-    print("\n[1/11] Scrape TOTO winning outlets")
+    print("\n[1/12] Scrape TOTO winning outlets")
     outlet_list = step1_scrape_aggregate()
     print(f"{len(outlet_list)} outlets")
 
-    print("\n[2/11] Scrape per-outlet details")
+    print("\n[2/12] Scrape per-outlet details")
     all_wins, scraped_outlets = step2_scrape_details(outlet_list)
     print(f"{len(scraped_outlets)} outlets, {len(all_wins)} win records")
 
-    print("\n[3/11] Parse GRA PDF")
+    print("\n[3/12] Parse GRA PDF")
     gra_outlets = step3_parse_gra()
     print(f"{len(gra_outlets)} GRA outlets")
 
-    print("\n[4/11] Download supplementary datasets")
+    print("\n[4/12] Download supplementary datasets")
     step4_download_supplementary()
 
-    print("\n[5/11] Merge data sources")
+    print("\n[5/12] Merge data sources")
     step5_merge(outlet_list, scraped_outlets, gra_outlets)
 
-    print("\n[6/11] Geocode outlets")
+    print("\n[6/12] Geocode outlets")
     geocoded = step6_geocode()
 
-    print("\n[7/11] Extract GeoJSON centroids")
+    print("\n[7/12] Extract GeoJSON centroids")
     lu_centroids, hdb_blocks = step7_extract_centroids()
 
-    print("\n[8/11] Build geospatial profiles")
+    print("\n[8/12] Build geospatial profiles")
     outlets = step8_build_geodata(geocoded, lu_centroids, hdb_blocks)
     print(f"{len(outlets)} outlets profiled")
 
-    print("\n[9/11] Compute earliest win years")
+    print("\n[9/12] Compute earliest win years")
     earliest_years = step9_earliest_win_years()
 
-    print("\n[10/11] Scrape operating hours")
+    print("\n[10/12] Scrape operating hours")
     hours = step10_scrape_hours()
 
-    print("\n[11/11] Save final dataset")
-    step11_save(outlets, hours, earliest_years)
+    print("\n[12/12] Save final dataset")
+    step12_save(outlets, hours, earliest_years)
 
     res = sum(1 for o in outlets if o["neighborhood_type"] == "residential")
     com = sum(1 for o in outlets if o["neighborhood_type"] == "commercial")
